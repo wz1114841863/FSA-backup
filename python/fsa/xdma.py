@@ -2,9 +2,26 @@ import os
 import time
 import numpy as np
 
+"""
+应用层 (Python)
+    ↓
+设备驱动接口 (dev_read/dev_write)
+    ↓
+Linux 设备文件 (/dev/xdma*)
+    ↓
+XDMA 内核驱动
+    ↓
+PCIe 总线
+    ↓
+FPGA 加速卡
+"""
+
+
 class DeviceError(IOError):
     """Custom exception for device I/O errors."""
+
     pass
+
 
 def dev_read(device_name: str, address: int, size: int) -> np.ndarray:
     """
@@ -47,6 +64,8 @@ def dev_read(device_name: str, address: int, size: int) -> np.ndarray:
         # Seek to the specified address if address is non-zero.
         # The C code's `if (addr)` implies seeking only if addr is non-zero.
         # os.lseek returns the new cursor position.
+        # os.SEEK_SET: 从文件开头计算偏移
+        # 对于DMA设备,地址通常是物理地址偏移
         if address != 0:
             current_pos = os.lseek(dev_fd, address, os.SEEK_SET)
             if current_pos != address:
@@ -65,6 +84,7 @@ def dev_read(device_name: str, address: int, size: int) -> np.ndarray:
             )
 
         # Convert the raw bytes to a NumPy array of unsigned 8-bit integers
+        # # np.frombuffer: 零拷贝,共享内存
         numpy_array = np.frombuffer(buffer, dtype=np.uint8)
         return numpy_array
 
@@ -74,12 +94,16 @@ def dev_read(device_name: str, address: int, size: int) -> np.ndarray:
         raise DeviceError(f"Permission denied for device: {device_name}")
     except OSError as e:
         # Catch other OS-level errors
-        raise DeviceError(f"OS error during read operation on {device_name}: {e.errno} - {os.strerror(e.errno)}")
-    except DeviceError: # Re-raise custom DeviceError
+        raise DeviceError(
+            f"OS error during read operation on {device_name}: {e.errno} - {os.strerror(e.errno)}"
+        )
+    except DeviceError:  # Re-raise custom DeviceError
         raise
     except Exception as e:
         # Catch any other unexpected errors
-        raise DeviceError(f"An unexpected error occurred during read on {device_name}: {e}")
+        raise DeviceError(
+            f"An unexpected error occurred during read on {device_name}: {e}"
+        )
     finally:
         # Ensure the device file descriptor is closed if it was opened
         if dev_fd != -1:
@@ -88,7 +112,9 @@ def dev_read(device_name: str, address: int, size: int) -> np.ndarray:
             except OSError as e:
                 # Log or handle close error if necessary, but don't let it mask an original error.
                 # In a more complex app, this might go to a logger.
-                print(f"Warning: Failed to close device {device_name} (fd: {dev_fd}): {e}")
+                print(
+                    f"Warning: Failed to close device {device_name} (fd: {dev_fd}): {e}"
+                )
 
 
 def dev_write(device_name: str, address: int, data: np.ndarray) -> int:
@@ -121,30 +147,32 @@ def dev_write(device_name: str, address: int, data: np.ndarray) -> int:
         raise TypeError("data must be a NumPy array.")
     if address < 0:
         raise ValueError("address must be a non-negative integer.")
-    
+
     # It's valid to write an empty array if its byte representation is empty,
     # but os.write might behave differently. The C code implies size > 0.
     # For consistency, let's ensure some bytes are written if array isn't truly "empty" conceptually.
     # data.tobytes() will handle various dtypes.
-    
+
     # Ensure data is C-contiguous for tobytes() to work reliably
-    if not data.flags['C_CONTIGUOUS']:
+    if not data.flags["C_CONTIGUOUS"]:
         data_contiguous = np.ascontiguousarray(data)
     else:
         data_contiguous = data
-        
+
     data_bytes = data_contiguous.tobytes()
     size_to_write = len(data_bytes)
 
     if data.size > 0 and size_to_write == 0:
         # This can happen if the dtype is unusual (e.g., object array of empty strings)
-        raise ValueError("Input NumPy array converted to an empty byte string, though it has elements.")
-    
+        raise ValueError(
+            "Input NumPy array converted to an empty byte string, though it has elements."
+        )
+
     # If size_to_write is 0 (e.g. from an empty array), os.write might write 0 bytes and succeed.
     # The C code implies size > 0 for a transaction.
     # If an empty write is intended, this will proceed. If not, the user should pass non-empty data.
 
-    dev_fd = -1 # Initialize file descriptor
+    dev_fd = -1  # Initialize file descriptor
     try:
         # Open the device
         dev_fd = os.open(device_name, os.O_RDWR)
@@ -173,14 +201,20 @@ def dev_write(device_name: str, address: int, data: np.ndarray) -> int:
     except PermissionError:
         raise DeviceError(f"Permission denied for device: {device_name}")
     except OSError as e:
-        raise DeviceError(f"OS error during write operation on {device_name}: {e.errno} - {os.strerror(e.errno)}")
-    except DeviceError: # Re-raise custom DeviceError
+        raise DeviceError(
+            f"OS error during write operation on {device_name}: {e.errno} - {os.strerror(e.errno)}"
+        )
+    except DeviceError:  # Re-raise custom DeviceError
         raise
     except Exception as e:
-        raise DeviceError(f"An unexpected error occurred during write on {device_name}: {e}")
+        raise DeviceError(
+            f"An unexpected error occurred during write on {device_name}: {e}"
+        )
     finally:
         if dev_fd != -1:
             try:
                 os.close(dev_fd)
             except OSError as e:
-                print(f"Warning: Failed to close device {device_name} (fd: {dev_fd}): {e}")
+                print(
+                    f"Warning: Failed to close device {device_name} (fd: {dev_fd}): {e}"
+                )

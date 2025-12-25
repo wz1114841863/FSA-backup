@@ -6,64 +6,110 @@ import argparse
 from fa_ref import *
 from fsa.tensor import MTile, ATile, STile
 
+
+"""
+用户调用:
+scaled_dot_product_attention(Q, K, V, br, bc)
+         ↓
+@F.kernel装饰器: 创建KernelContext,执行函数体
+         ↓
+在函数体内调用F.load_tile(...)
+         ↓
+@check_kernel_ctx装饰器: 检查是否在kernel上下文中
+         ↓
+load_tile函数: 生成DMA指令,添加到__g_kernel_ctx
+         ↓
+@F.kernel装饰器收集完所有指令,创建Kernel对象
+         ↓
+返回Kernel对象(未执行!)
+"""
+
+
 @F.kernel
-def scaled_dot_product_attention(Q: MTile, K: MTile, V_t: MTile, br: int, bc: int) -> MTile:
+def scaled_dot_product_attention(
+    Q: MTile, K: MTile, V_t: MTile, br: int, bc: int
+) -> MTile:
     assert (len(Q.shape), len(K.shape), len(V_t.shape)) == (2, 2, 2)
     seq_q, d = Q.shape
     seq_k, dk = K.shape
-    dv, seq_v = V_t.shape
+    dv, seq_v = V_t.shape  # V_t: [d, seq_v] 注意:这里V是转置的.
     assert d == dk and d == dv and seq_k == seq_v
+    # bc == d 是硬件限制: 键的块大小必须等于特征维度
     assert bc == d, "FSA requires bc == d"
 
     O_t: MTile = F.alloc_mem((d, seq_q), F.fp32)
-    Q_BLOCKS = Q.split(br, dim=-2) # [br, d]
-    K_BLOCKS = K.split(bc, dim=-2) # [bc, d]
-    V_t_BLOCKS = V_t.split(bc, dim=-1) # [d, bc]
-    O_t_BLOCKS = O_t.split(br, dim=-1) # [d, br]
+    Q_BLOCKS = Q.split(br, dim=-2)  # [seq_q, d] → 多个 [br, d]
+    K_BLOCKS = K.split(bc, dim=-2)  # [seq_k, d] → 多个 [bc, d]
+    V_t_BLOCKS = V_t.split(bc, dim=-1)  # [d, seq_v] → 多个 [d, bc]
+    O_t_BLOCKS = O_t.split(br, dim=-1)  # [d, seq_q] → 多个 [d, br]
 
-    # [Br, d]
+    # [Br, d] - Q块在暂存器中的存储, 利用双缓冲
+    # 当一个Q_tile在计算时,另一个可以加载下一个Q块,隐藏DMA延迟,提高硬件利用率
     Q_tiles = [F.alloc_spad((br, d)) for _ in range(2)]
-    # log exp sum [Br, 1]
+    # log exp sum [Br, 1] - LSE(Log Sum Exp)在累加器中
     L_tile = F.alloc_accumulator((1, br))
-    # [d, Br]
+    # [d, Br] - 输出在累加器中的存储(转置的)
     O_t_tile = F.alloc_accumulator((d, br))
 
-    # double-buffer KV
+    # double-buffer KV, 同样采用了双缓冲
     K_tiles = [F.alloc_spad((bc, d)) for _ in range(2)]
     V_t_tiles = [F.alloc_spad((d, bc)) for _ in range(2)]
 
+    # 每个资源有独立的信号量(Q, K, V, O)
+    # 双缓冲: 每个buffer有自己的信号量
     sem_q_lst = [F.Semaphore(id=0, n=2), F.Semaphore(id=1, n=2)]
     sem_k_lst = [F.Semaphore(id=2, n=2), F.Semaphore(id=3, n=2)]
     sem_v_lst = [F.Semaphore(id=4, n=2), F.Semaphore(id=5, n=2)]
     sem_o = F.Semaphore(id=6, n=2)
 
     for i, Q_i in enumerate(Q_BLOCKS):
-        Q_tile = Q_tiles[i % 2]
-        sem_q = sem_q_lst[i % 2]
+        # 选择当前使用的Q buffer
+        Q_tile = Q_tiles[i % 2]  # 双缓冲切换
+        sem_q = sem_q_lst[i % 2]  # 对应的信号量
+        # 反转Q_tile以匹配硬件要求
         Q_tile_rev = Q_tile.reverse(dim=0)
+        # 加载Q块到spad
         F.load_tile(Q_i, Q_tile, sem_q)
         for j, (K_j, V_t_j) in enumerate(zip(K_BLOCKS, V_t_BLOCKS)):
+            # # 判断是否为第一个/最后一个迭代
             is_first_iter = j == 0
             is_last_iter = j == len(K_BLOCKS) - 1
+            # 选择当前使用的KV buffer
             buffer = j % 2
             K_tile, V_t_tile = K_tiles[buffer], V_t_tiles[buffer]
             sem_k, sem_v = sem_k_lst[buffer], sem_v_lst[buffer]
-
+            # 加载Q块到脉动阵列
+            # 信号量控制:第一个迭代等待加载完成,最后一个迭代释放
             F.mx_load_stationary(Q_tile_rev, sem_q, aq=is_first_iter, rl=is_last_iter)
-
+            # 加载K块到spad
             F.load_tile(K_j, K_tile, sem_k)
+            # 计算注意力分数
             F.mx_attn_score(K_tile, L_tile, not is_first_iter, sem_k)
-
+            # 加载V块(已转置)到spad
             F.load_tile(V_t_j, V_t_tile, sem_v)
+            # 计算注意力值
             F.mx_attn_value(V_t_tile, O_t_tile, not is_first_iter, sem_v)
         # end inner loop
+        # 计算倒数: 1 / sum(exp)
         F.mx_reciprocal(L_tile, None)
+        # LSE归一化: O_i = exp(S_ij - L_i) * V_j 的最终计算
         F.mx_attn_lse_norm(O_t_tile, sem_o, aq=False, rl=True)
+        # 存储结果到主存
         F.store_tile(O_t_tile, O_t_BLOCKS[i], sem_o)
+    # 等待所有操作完成
     F.fence(mx=True, dma=True, stop=True)
     return O_t
 
-def ref_pyeasyfloat(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, br: int, bc: int, verbose: bool) -> np.ndarray:
+
+def ref_pyeasyfloat(
+    Q_np: np.ndarray,
+    K_np: np.ndarray,
+    V_np: np.ndarray,
+    br: int,
+    bc: int,
+    verbose: bool,
+) -> np.ndarray:
+    """Reference implementation using PyEasyFloat"""
     row_blocks = Q_np.shape[0] // br
     col_blocks = K_np.shape[0] // bc
     d = Q_np.shape[-1]
@@ -72,17 +118,26 @@ def ref_pyeasyfloat(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, br: in
     V_BLOCKS = np.split(V_np, col_blocks, axis=-2)
     backend = PyEasyFloatBackend()
     res = []
+    # 外层循环,遍历Q的block
     for i, Q_i in enumerate(Q_BLOCKS):
+        # 中间结果初始化
         PrevO = np.full((br, d), np.float32(0))
         PrevRowMax = np.full((br, 1), np.float32(-np.inf))
         PrevRowSum = np.full((br, 1), np.float32(0))
+        # 内层循环,遍历K,V的block
         for j, (K_j, V_j) in enumerate(zip(K_BLOCKS, V_BLOCKS)):
             tile = FlashAttentionTile(
-                Q_i, K_j, V_j,
-                PrevRowMax, PrevRowSum, PrevO,
-                mul_ew=5, mul_mw=10,
-                acc_ew=8, acc_mw=23,
-                backend=backend
+                Q_i,
+                K_j,
+                V_j,
+                PrevRowMax,
+                PrevRowSum,
+                PrevO,
+                mul_ew=5,
+                mul_mw=10,
+                acc_ew=8,
+                acc_mw=23,
+                backend=backend,
             )
             if verbose:
                 print(str(tile))
@@ -92,20 +147,29 @@ def ref_pyeasyfloat(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray, br: in
         res.append(mat_to_numpy_array(tile.NormO))
     return np.concatenate(res, axis=0)
 
+
 def ref_torch(Q_np: np.ndarray, K_np: np.ndarray, V_np: np.ndarray) -> np.ndarray:
-    Q_torch = torch.from_numpy(Q_np)
-    K_torch = torch.from_numpy(K_np)
-    V_torch = torch.from_numpy(V_np)
-    O_torch = torch.nn.functional.scaled_dot_product_attention(Q_torch, K_torch, V_torch)
-    return O_torch.numpy()
+    """Reference implementation using PyTorch scaled_dot_product_attention"""
+    with torch.no_grad():
+        Q_torch = torch.from_numpy(Q_np)
+        K_torch = torch.from_numpy(K_np)
+        V_torch = torch.from_numpy(V_np)
+        O_torch = torch.nn.functional.scaled_dot_product_attention(
+            Q_torch, K_torch, V_torch
+        )
+        return O_torch.numpy()
 
 
 def main(
-        seq_q: int, seq_kv: int, d: int, br: int, bc: int,
-        engine: F.engine.BaseEngine,
-        diff_easyfloat: bool = False,
-        easyfloat_verbose: bool = False
-    ):
+    seq_q: int,  # sequence length for query
+    seq_kv: int,  # sequence length for key/value
+    d: int,  # dimension
+    br: int,  # FlashAttention br
+    bc: int,  # FlashAttention bc
+    engine: F.engine.BaseEngine,
+    diff_easyfloat: bool = False,  # args.diff
+    easyfloat_verbose: bool = False,  # args.diff_verbose
+):
     np.random.seed(0)
     Q_np = np.random.rand(seq_q, d).astype(np.float16)
     K_np = np.random.rand(seq_kv, d).astype(np.float16)
@@ -118,60 +182,100 @@ def main(
         V_t = F.from_numpy(V_np.T)
         O_t = engine.execute(scaled_dot_product_attention(Q, K, V_t, br, bc))
         O = F.to_numpy(O_t).T
-        impls['FSA'] = O
+        impls["FSA"] = O
 
     if diff_easyfloat:
         print("Comparing with PyEasyFloat...")
         if easyfloat_verbose:
             print("PyEasyFloat verbose mode enabled.")
         O_pyeasyfloat = ref_pyeasyfloat(Q_np, K_np, V_np, br, bc, easyfloat_verbose)
-        impls['PyEasyFloat'] = O_pyeasyfloat
+        impls["PyEasyFloat"] = O_pyeasyfloat
 
     print("Comparing with Torch...")
     O_torch = ref_torch(Q_np, K_np, V_np)
 
-    F.compare_matrices(
-        ('torch', O_torch),
-        impls
-    )
+    F.compare_matrices(("torch", O_torch), impls)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seq_q', type=int, default=4, help='Sequence length for query')
-    parser.add_argument('--seq_kv', type=int, default=4, help='Sequence length for key/value')
-    parser.add_argument('--config', type=str, default='FSA4X4Fp16Config', help='Chisel generation config')
-    parser.add_argument('--engine', type=str, default='Verilator', choices=['Verilator', 'FPGA'])
-    parser.add_argument('--build_dir', type=str, default=None)
-    parser.add_argument('--output_dir', type=str, default='/tmp', help='Output directory')
-    parser.add_argument('--diff', action='store_true', help='Compare result with PyEasyFloat')
-    parser.add_argument('--diff_verbose', action='store_true', help='Enable verbose mode for PyEasyFloat')
-    parser.add_argument('--diff_only', action='store_true', help='Only run PyEasyFloat, skip real hardware execution')
-    parser.add_argument('--simulator_bin', type=str, default=None, help='[VerilatorOnly] Path to the simulator binary')
-    parser.add_argument('--vcdfile', type=str, default=None, help='[VerilatorOnly] Path to the VCD file')
-    parser.add_argument('--numactl', type=str, default=None, help='[VerilatorOnly] Command to run the simulator with NUMA control')
-    parser.add_argument('--max_cycles', type=int, default=0, help='[VerilatorOnly] Maximum number of cycles to run the simulation')
+    parser.add_argument(
+        "--seq_q", type=int, default=4, help="Sequence length for query"
+    )
+    parser.add_argument(
+        "--seq_kv", type=int, default=4, help="Sequence length for key/value"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="FSA4X4Fp16Config",
+        help="Chisel generation config",
+    )
+    parser.add_argument(
+        "--engine", type=str, default="Verilator", choices=["Verilator", "FPGA"]
+    )
+    parser.add_argument("--build_dir", type=str, default=None)
+    parser.add_argument(
+        "--output_dir", type=str, default="/tmp", help="Output directory"
+    )
+    parser.add_argument(
+        "--diff", action="store_true", help="Compare result with PyEasyFloat"
+    )
+    parser.add_argument(
+        "--diff_verbose",
+        action="store_true",
+        help="Enable verbose mode for PyEasyFloat",
+    )
+    parser.add_argument(
+        "--diff_only",
+        action="store_true",
+        help="Only run PyEasyFloat, skip real hardware execution",
+    )
+    parser.add_argument(
+        "--simulator_bin",
+        type=str,
+        default=None,
+        help="[VerilatorOnly] Path to the simulator binary",
+    )
+    parser.add_argument(
+        "--vcdfile", type=str, default=None, help="[VerilatorOnly] Path to the VCD file"
+    )
+    parser.add_argument(
+        "--numactl",
+        type=str,
+        default=None,
+        help="[VerilatorOnly] Command to run the simulator with NUMA control",
+    )
+    parser.add_argument(
+        "--max_cycles",
+        type=int,
+        default=0,
+        help="[VerilatorOnly] Maximum number of cycles to run the simulation",
+    )
     args = parser.parse_args()
 
     if args.build_dir is None:
-        build_dir = os.path.join('..', '..', '..', 'sims', 'verilator')
+        build_dir = os.path.join("..", "..", "..", "sims", "verilator")
     else:
         build_dir = args.build_dir
-    long_name = 'chipyard.harness.TestHarness.' + args.config
+    long_name = "chipyard.harness.TestHarness." + args.config
     config_file = os.path.join(
-        build_dir, 'generated-src', long_name,
-        long_name + '.FSAConfig.json'
+        build_dir, "generated-src", long_name, long_name + ".FSAConfig.json"
     )
 
     if args.diff_only:
         engine = None
-    elif args.engine == 'Verilator':
-
+    elif args.engine == "Verilator":
         if args.simulator_bin is not None:
             simulator_bin = args.simulator_bin
         else:
-            simulator_bin = os.path.join(build_dir, 'simulator-chipyard.harness-' + args.config + '-debug')
+            simulator_bin = os.path.join(
+                build_dir, "simulator-chipyard.harness-" + args.config + "-debug"
+            )
             if not os.path.isfile(simulator_bin):
-                simulator_bin = os.path.join(build_dir, 'simulator-chipyard.harness-' + args.config)
+                simulator_bin = os.path.join(
+                    build_dir, "simulator-chipyard.harness-" + args.config
+                )
         if os.path.isfile(simulator_bin):
             print(f"Using simulator binary: {simulator_bin}")
         else:
@@ -182,32 +286,37 @@ if __name__ == "__main__":
             vcdfile=args.vcdfile,
             output_dir=args.output_dir,
             max_cycles=args.max_cycles,
-            numactl_cmd=args.numactl
+            numactl_cmd=args.numactl,
         )
-    elif args.engine == 'FPGA':
+    elif args.engine == "FPGA":
         if args.build_dir is None:
-            build_dir = os.path.join('..', '..', '..', 'fpga')
+            build_dir = os.path.join("..", "..", "..", "fpga")
         else:
             build_dir = args.build_dir
-        long_name = 'chipyard.fpga.u55c.U55CFPGATestHarness.' + args.config
+        long_name = "chipyard.fpga.u55c.U55CFPGATestHarness." + args.config
         config_file = os.path.join(
-            build_dir, 'generated-src', long_name,
-            long_name + '.FSAConfig.json'
+            build_dir, "generated-src", long_name, long_name + ".FSAConfig.json"
         )
         engine = F.FPGA()
     else:
         assert f"{args.engine} is not supported yet."
 
-
     if not os.path.isfile(config_file):
-        print(f"Warning: Config file not found: {config_file}. Using default FSA config.")
+        print(
+            f"Warning: Config file not found: {config_file}. Using default FSA config."
+        )
     else:
         print(f"Loading config from: {config_file}")
         F.init(config_file)
         cfg = F.get_config()
 
     main(
-        args.seq_q, args.seq_kv,
-        d=cfg.sa_rows, br=cfg.sa_cols, bc=cfg.sa_rows, engine=engine,
-        diff_easyfloat=args.diff, easyfloat_verbose=args.diff_verbose
+        args.seq_q,
+        args.seq_kv,
+        d=cfg.sa_rows,
+        br=cfg.sa_cols,
+        bc=cfg.sa_rows,
+        engine=engine,
+        diff_easyfloat=args.diff,
+        easyfloat_verbose=args.diff_verbose,
     )
