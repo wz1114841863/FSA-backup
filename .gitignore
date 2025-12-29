@@ -6,3 +6,5 @@ build
 *.vcd
 *.fst
 *.log
+
+vcd

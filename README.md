@@ -1,6 +1,26 @@
 # FSA: Fusing FlashAttention within a Single Systolic Array
-
-**FSA executes _every_ FlashAttention operation within a single systolic array — without requiring vector units!**  
+## 仓库源地址
+```
+https://github.com/VCA-EPFL/FSA
+https://github.com:VCA-EPFL/chipyard-fsa
+```
+## 环境配置
+```
+# fsa重新构建了一个包含有fsa的chipyrad
+git clone git@github.com:VCA-EPFL/chipyard-fsa.git
+cd chipyard-fsa
+ ./build-setup.sh --skip-ctags --skip-firesim --skip-marshal
+```
+## 测试
+```
+# 硬件编译
+cd chipyard-fsa/sims/verilator
+# Generate a 4x4 Fp16-mul-Fp32-acc systolic array
+make CONFIG=FSA4X4Fp16Config
+# python + verilator仿真测试
+uv run main.py --seq_q 4 --seq_kv 4 --config FSA4X4Fp16Config --diff --diff_verbose
+```
+**FSA executes _every_ FlashAttention operation within a single systolic array — without requiring vector units!**
 Enjoy computing non-matrix-multiplication operations using matrix-multiplication FLOPs.
 
 - Attention operations are overlapped element-wise within the systolic array to minimize execution latency.
@@ -114,7 +134,7 @@ We provide two options to integrate FSA into Chipyard:
 
 ## FPGA Support
 
-[AMD U55C FPGA board](https://www.amd.com/en/products/accelerators/alveo/u55c/a-u55c-p00g-pq-g.html) is supported by this project. 
+[AMD U55C FPGA board](https://www.amd.com/en/products/accelerators/alveo/u55c/a-u55c-p00g-pq-g.html) is supported by this project.
 
 ![FPGA arch](./docs/fpga.jpg)
 
