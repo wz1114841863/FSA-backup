@@ -5,31 +5,47 @@ import chisel3.util._
 import chisel3.experimental.IntParam
 import testchipip.tsi.TSIIO
 
-class FSASimTSI(chipId: Int) extends BlackBox(Map("CHIPID" -> IntParam(chipId))) with HasBlackBoxResource {
-  val io = IO(new Bundle {
-    val clock = Input(Clock())
-    val reset = Input(Bool())
-    val tsi = Flipped(new TSIIO)
-    val exit = Output(UInt(32.W))
-  })
-  addResource("/fsa/vsrc/FSASimTSI.v")
-  addResource("/fsa/csrc/FSASimTSI.cc")
-  addResource("/fsa/csrc/fsa_tsi.cc")
-  addResource("/fsa/csrc/fsa_tsi.h")
+/*
+    测试与仿真接口(Test and Simulation Interface, TSI)的封装模块,
+    用于在硬件仿真中连接软件测试环境.
+ */
+
+class FSASimTSI(chipId: Int)
+    extends BlackBox(Map("CHIPID" -> IntParam(chipId)))
+    with HasBlackBoxResource {
+    val io = IO(new Bundle {
+        val clock = Input(Clock())
+        val reset = Input(Bool())
+        val tsi = Flipped(new TSIIO)
+        val exit = Output(UInt(32.W))
+    })
+    addResource("/fsa/vsrc/FSASimTSI.v")
+    addResource("/fsa/csrc/FSASimTSI.cc")
+    addResource("/fsa/csrc/fsa_tsi.cc")
+    addResource("/fsa/csrc/fsa_tsi.h")
 }
 
 object FSASimTSI {
-  def connect(tsi: Option[TSIIO], clock: Clock, reset: Reset, chipId: Int = 0): Bool = {
-    val exit = tsi.map { s =>
-      val sim = Module(new FSASimTSI(chipId))
-      sim.io.clock := clock
-      sim.io.reset := reset
-      sim.io.tsi <> s
-      sim.io.exit
-    }.getOrElse(0.U)
-    val success = exit === 1.U
-    val error = exit >= 2.U
-    assert(!error, "*** FAILED *** (exit code = %d)\n", exit >> 1.U)
-    success
-  }
+    // 辅助函数,用于将 TSI 模块实例化
+    // 并连接到测试平台的时钟和复位信号上
+    def connect(
+        tsi: Option[TSIIO],
+        clock: Clock,
+        reset: Reset,
+        chipId: Int = 0
+    ): Bool = {
+        val exit = tsi
+            .map { s =>
+                val sim = Module(new FSASimTSI(chipId))
+                sim.io.clock := clock
+                sim.io.reset := reset
+                sim.io.tsi <> s
+                sim.io.exit
+            }
+            .getOrElse(0.U)
+        val success = exit === 1.U
+        val error = exit >= 2.U
+        assert(!error, "*** FAILED *** (exit code = %d)\n", exit >> 1.U)
+        success
+    }
 }

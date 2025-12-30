@@ -8,17 +8,12 @@ import fsa.arithmetic._
 object AccumulatorCmd {
     def width = 3
 
-    def EXP_S1 = 0.U(width.W)
-
-    def EXP_S2 = 1.U(width.W)
-
-    def ACC_SA = 2.U(width.W)
-
-    def ACC = 3.U(width.W)
-
-    def SET_SCALE = 4.U(width.W)
-
-    def RECIPROCAL = 5.U(width.W)
+    def EXP_S1 = 0.U(width.W) // scale = sa_in * lg2e/sqrt(dk)
+    def EXP_S2 = 1.U(width.W) // scale = pow2(scale)
+    def ACC_SA = 2.U(width.W) // out = scale * sram_in + sa_in
+    def ACC = 3.U(width.W) // out = scale * sram_in + 0
+    def SET_SCALE = 4.U(width.W) // scale = sram_in
+    def RECIPROCAL = 5.U(width.W) // scale = 1/scale
 }
 
 class AccumulatorControl extends Bundle {

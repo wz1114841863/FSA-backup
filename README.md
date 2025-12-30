@@ -20,6 +20,50 @@ make CONFIG=FSA4X4Fp16Config
 # python + verilator仿真测试
 uv run main.py --seq_q 4 --seq_kv 4 --config FSA4X4Fp16Config --diff --diff_verbose
 ```
+
+```
+graph TD
+    subgraph Host ["主机 (Host / Python & C++)"]
+        Py[Python Compiler] -->|生成指令流| Bin[Binary Instructions]
+        Bin -->|TSI 接口| Decoder
+    end
+
+    subgraph Hardware ["FSA 硬件 (Chisel Design)"]
+        Decoder -->|DMA 指令| DMA[DMA Engine]
+        Decoder -->|Matrix 指令| Ctrl[Matrix Controller]
+
+        %% 内存交互
+        DRAM["DRAM / Main Memory"] <-->|AXI4 Bus| DMA
+
+        %% 片上存储
+        DMA -->|Write Q,K,V| Spad["Scratchpad SRAM"]
+        DMA -->|Read O| AccSRAM["Accumulator SRAM"]
+
+        %% 核心计算路径
+        Spad -->|Read| InputDelayer
+        InputDelayer --> SA["Systolic Array<br/>(PEs + CMP)"]
+
+        Ctrl -.->|Control Signals| Spad
+        Ctrl -.->|Control Signals| SA
+        Ctrl -.->|Control Signals| AccUnit
+        Ctrl -.->|Control Signals| AccSRAM
+
+        %% 回写路径
+        SA -->|Partial Sums| AccUnit[Accumulator]
+        AccUnit <-->|Read/Write| AccSRAM
+
+        %% 同步机制
+        DMA -- Sync (Semaphore) --> Ctrl
+    end
+
+    %% 数据流标注
+    linkStyle 4 stroke-width:2px,fill:none,stroke:blue
+    linkStyle 5 stroke-width:2px,fill:none,stroke:blue
+    linkStyle 6 stroke-width:2px,fill:none,stroke:green
+    linkStyle 7 stroke-width:4px,fill:none,stroke:red
+    linkStyle 10 stroke-width:2px,fill:none,stroke:green
+```
+
 **FSA executes _every_ FlashAttention operation within a single systolic array — without requiring vector units!**
 Enjoy computing non-matrix-multiplication operations using matrix-multiplication FLOPs.
 
